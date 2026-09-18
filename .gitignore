@@ -1,0 +1,9 @@
+__pycache__
+.lab.yml.bak
+.DS_store
+.venv/
+clab-*
+logs/*.log
+logs/positions.yaml
+setup.log
+.zed/
