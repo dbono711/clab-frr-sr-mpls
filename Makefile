@@ -48,10 +48,10 @@ clean: initialize-log
 inspect:
 	@sudo clab inspect --topo lab.yml
 
-.PHONY: p1 p2 p3 p4 pe1 pe2 rr bdr1
-p1 p2 p3 p4 pe1 pe2 rr bdr1:
+.PHONY: p1 p2 p3 p4 p5 p6 pe11 pe12 rr14 bdr13
+p1 p2 p3 p4 p5 p6 pe11 pe12 rr14 bdr13:
 	$(call exec_vtysh,$(subst -,_,$@))
 
-.PHONY: c1 c2 c3
-c1 c2 c3:
+.PHONY: c1 c2 c3 pola
+c1 c2 c3 pola:
 	$(call exec_shell,$(subst -,_,$@))

@@ -1,0 +1,16 @@
+asn: 65000
+srPolicy:
+  pcepSessionAddr: "172.28.1.2"
+  srcAddr: "172.16.0.1"
+  dstAddr: "172.16.0.6"
+  name: pe1-RED-pce-via-p3
+  color: 1
+  segmentList:
+    - sid: "16102"
+      localAddr: "172.16.0.2"
+    - sid: "16104"
+      localAddr: "172.16.0.4"
+    - sid: "16105"
+      localAddr: "172.16.0.5"
+    - sid: "16106"
+      localAddr: "172.16.0.6"
