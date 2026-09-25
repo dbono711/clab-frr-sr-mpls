@@ -66,8 +66,12 @@ Six core routers (`p1`–`p6`) form a ring (`p1—p2—p3—p6—p5—p4—p1`) 
 | pe12–p6  (eth1/eth3) | 10.0.1.16/31 | default |
 | bdr13–p3 (eth1/eth2) | 10.0.1.18/31 | default |
 | rr14–p1  (eth1/eth4) | 10.0.1.20/31 | default |
+| pe11–p4  (eth2/eth2) | 10.0.1.22/31 | default |
+| pe12–p3  (eth2/eth4) | 10.0.1.24/31 | default |
 
-Edge attachments: `pe11` connects to `p1`; `pe12` connects to `p6`; `bdr13` (border) connects to `p3`; `rr14` (route reflector) connects to `p1`.
+Edge attachments: `pe11` connects to **both** `p1` and `p4`; `pe12` connects to **both** `p6` and `p3`; `bdr13` (border) connects to `p3`; `rr14` (route reflector) connects to `p1`.
+
+Dual-homing each PE into two different points on the ring does more than add redundancy — it creates two fully disjoint, **equal-cost** 4-hop paths between `pe11` and `pe12`: `pe11–p1–p2–p3–pe12` and `pe11–p4–p5–p6–pe12` (both cost 40 at the default per-hop metric of 10; neither touches the metric-100 `p2–p5`/`p5–p6` links). This supersedes the old single 5-hop ring-only path as the shortest, and means IS-IS ECMP is now live between the PEs — don't assume traffic deterministically takes one path over the other without checking `show ip route` first.
 
 ### Segment Routing Label Ranges
 

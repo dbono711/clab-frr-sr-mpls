@@ -28,11 +28,11 @@ Confirm all 14 containers (`pe11`, `pe12`, `p1`–`p6`, `bdr13`, `rr14`, `c1`–
 Per SR-capable node, checking only the interfaces that node's `<node>.sh` actually enables (`rr14` has none — it has no SR/MPLS role and is skipped entirely at this layer):
 
 ```shell
-docker exec -it clab-frr-sr-mpls-pe11 sysctl net.mpls.conf.eth1.input net.mpls.conf.lo.input net.mpls.platform_labels
-docker exec -it clab-frr-sr-mpls-pe12 sysctl net.mpls.conf.eth1.input net.mpls.conf.lo.input net.mpls.platform_labels
+docker exec -it clab-frr-sr-mpls-pe11 sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.lo.input net.mpls.platform_labels
+docker exec -it clab-frr-sr-mpls-pe12 sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.lo.input net.mpls.platform_labels
 docker exec -it clab-frr-sr-mpls-p1   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.eth4.input net.mpls.conf.lo.input net.mpls.platform_labels
 docker exec -it clab-frr-sr-mpls-p2   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.lo.input net.mpls.platform_labels
-docker exec -it clab-frr-sr-mpls-p3   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.lo.input net.mpls.platform_labels
+docker exec -it clab-frr-sr-mpls-p3   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.eth4.input net.mpls.conf.lo.input net.mpls.platform_labels
 docker exec -it clab-frr-sr-mpls-p4   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.lo.input net.mpls.platform_labels
 docker exec -it clab-frr-sr-mpls-p5   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.lo.input net.mpls.platform_labels
 docker exec -it clab-frr-sr-mpls-p6   sysctl net.mpls.conf.eth1.input net.mpls.conf.eth2.input net.mpls.conf.eth3.input net.mpls.conf.lo.input net.mpls.platform_labels
@@ -53,12 +53,12 @@ Expected adjacency map (from `lab.yml`'s current link set):
 
 | Node | Neighbors |
 |---|---|
-| pe11 | p1 |
-| pe12 | p6 |
+| pe11 | p1, p4 |
+| pe12 | p6, p3 |
 | p1 | pe11, p2, p4, rr14 |
 | p2 | p1, p3, p5 |
-| p3 | p2, p6, bdr13 |
-| p4 | p1, p5 |
+| p3 | p2, p6, bdr13, pe12 |
+| p4 | p1, p5, pe11 |
 | p5 | p4, p2, p6 |
 | p6 | p3, p5, pe12 |
 | bdr13 | p3 |
@@ -125,7 +125,13 @@ docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show isis route backup"
 
 Look for `pe12`'s loopback (`172.16.0.12/32`) showing both a primary and a backup/repair nexthop.
 
-**Failover** — `p2↔p3` sits on the default-cost path (`pe11→p1→p2→p3→p6→pe12`; the `p2–p5`/`p5–p6` chord carries the metric-100 penalty, so SPF avoids it). Start continuous client traffic, then fail the link:
+**Failover** — `pe11` is now dual-homed (`p1` and `p4`), which gives two disjoint, equal-cost 4-hop paths to `pe12`: `p1-p2-p3` and `p4-p5-p6` (both cost 40; the `p2–p5`/`p5–p6` chord still carries the metric-100 penalty, so it's never on either shortest path). That means which path any given flow actually takes is an ECMP hash outcome, not a fixed assumption — **check first**, then fail a link on whichever path is actually in use:
+
+```shell
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 172.16.0.12/32"
+```
+
+If it's riding `p1-p2-p3`, fail `p2↔p3`; if it's riding `p4-p5-p6`, fail `p4↔p5` or `p5↔p6` instead. Start continuous client traffic, then fail the link that's actually carrying it:
 
 ```shell
 docker exec -it clab-frr-sr-mpls-c1 ping 10.10.2.2
@@ -134,14 +140,14 @@ docker exec -it clab-frr-sr-mpls-c1 ping 10.10.2.2
 docker exec -it clab-frr-sr-mpls-p2 vtysh -c "configure terminal" -c "interface eth2" -c "shutdown"
 ```
 
-**Expected with TI-LFA working**: at most one or two dropped pings (sub-second local repair) — not the multi-second gap you'd see waiting for IS-IS to fully reconverge (flood LSPs, recompute SPF domain-wide). Confirm the repair happened:
+**Expected with TI-LFA working**: at most one or two dropped pings (sub-second local repair) — not the multi-second gap you'd see waiting for IS-IS to fully reconverge (flood LSPs, recompute SPF domain-wide). The local repair happens at the point of local repair — `p2` itself, the node directly upstream of the failed link — so confirm there first:
 
 ```shell
-docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show ip route 172.16.0.12/32"
-docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show mpls table"
+docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show ip route 172.16.0.12/32"
+docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show mpls table"
 ```
 
-Should reflect the backup path (e.g. via `p4`/`p5`) immediately after the shutdown.
+Should reflect a repair nexthop other than the now-dead `eth2` immediately after the shutdown — with the ECMP topology, exactly which alternate path it lands on (back through `p1` toward the `p4-p5-p6` side, or some other repair) is worth just reading off the output rather than assuming.
 
 **Recovery**:
 

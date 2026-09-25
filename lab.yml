@@ -212,8 +212,12 @@ topology:
     # EDGE
     ## pe11-p1
     - endpoints: ["pe11:eth1", "p1:eth1"]
+    ## pe11-p4
+    - endpoints: ["pe11:eth2", "p4:eth2"]
     ## pe12-p6
     - endpoints: ["pe12:eth1", "p6:eth3"]
+    ## pe12-p3
+    - endpoints: ["pe12:eth2", "p3:eth4"]
 
     # BORDER
     ## bdr13-p3
