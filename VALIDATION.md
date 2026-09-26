@@ -77,6 +77,33 @@ docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show ip route isis"
 
 Every node should have an ISIS-learned `/32` route to every other node's loopback (`172.16.0.2`–`.7`, `.11`–`.14`).
 
+### Link affinities
+
+Every SR-capable node defines the same two affinity maps; interfaces on the two disjoint PE-to-PE paths are colored on both ends.
+
+```shell
+docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show running-config" | grep affinity
+```
+
+Expect `affinity-map RED bit-position 0` / `affinity-map BLUE bit-position 1` plus a `link-params` / `affinity <NAME>` / `exit-link-params` block on each colored interface.
+
+**This grep is the actual test.** FRR silently discards unrecognized interface commands during `vtysh -b`, so a coloring mistake shows up as *nothing at all* in the running config rather than an error. If `affinity` lines are missing here but present in `frr.conf`, the syntax is being rejected — note that `isis affinity flex-algo NAME` (in FRR's current online docs) does **not** exist in 10.7.1 and will vanish exactly this way.
+
+```shell
+docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show isis interface detail"
+```
+
+Check the admin-group/affinity attribute on `eth1` and `eth2` (both RED on `p1`). Expected coloring, both ends of each link:
+
+| Affinity | Links |
+|---|---|
+| RED  | `pe11:eth1↔p1:eth1`, `p1:eth2↔p2:eth1`, `p2:eth2↔p3:eth1`, `p3:eth4↔pe12:eth2` |
+| BLUE | `pe11:eth2↔p4:eth2`, `p4:eth3↔p5:eth1`, `p5:eth2↔p6:eth2`, `p6:eth3↔pe12:eth1` |
+
+Cross-links (`p1↔p4`, `p2↔p5`, `p3↔p6`) and the `rr14`/`bdr13` attachments should show **no** affinity — that's deliberate, so a constrained Flex-Algo can't hop between the RED and BLUE planes mid-path.
+
+Nothing consumes these affinities yet (no Flex-Algo Definition is configured), so this layer only confirms the coloring is advertised correctly. Also worth confirming at first deploy: whether the advertised admin-group shows up without `mpls-te on` under `router isis` — FRR's docs don't state a dependency either way for flex-algo affinities.
+
 ---
 
 ## Layer 3 — Segment Routing label programming
@@ -125,13 +152,13 @@ docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show isis route backup"
 
 Look for `pe12`'s loopback (`172.16.0.12/32`) showing both a primary and a backup/repair nexthop.
 
-**Failover** — `pe11` is now dual-homed (`p1` and `p4`), which gives two disjoint, equal-cost 4-hop paths to `pe12`: `p1-p2-p3` and `p4-p5-p6` (both cost 40; the `p2–p5`/`p5–p6` chord still carries the metric-100 penalty, so it's never on either shortest path). That means which path any given flow actually takes is an ECMP hash outcome, not a fixed assumption — **check first**, then fail a link on whichever path is actually in use:
+**Failover** — `pe11` is dual-homed (`p1` and `p4`), giving two disjoint 4-hop paths to `pe12`, but they are **not** equal-cost: `p1-p2-p3` costs 40, `p4-p5-p6` costs 130 (it crosses the metric-100 `p5–p6` link). SPF always picks `p1-p2-p3`, so `p2↔p3` is reliably on the active path. Confirm before failing anything:
 
 ```shell
 docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 172.16.0.12/32"
 ```
 
-If it's riding `p1-p2-p3`, fail `p2↔p3`; if it's riding `p4-p5-p6`, fail `p4↔p5` or `p5↔p6` instead. Start continuous client traffic, then fail the link that's actually carrying it:
+Start continuous client traffic, then fail the link:
 
 ```shell
 docker exec -it clab-frr-sr-mpls-c1 ping 10.10.2.2
@@ -147,7 +174,7 @@ docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show ip route 172.16.0.12/32"
 docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show mpls table"
 ```
 
-Should reflect a repair nexthop other than the now-dead `eth2` immediately after the shutdown — with the ECMP topology, exactly which alternate path it lands on (back through `p1` toward the `p4-p5-p6` side, or some other repair) is worth just reading off the output rather than assuming.
+Should reflect a repair nexthop other than the now-dead `eth2` immediately after the shutdown — read the actual alternate off the output rather than assuming which one TI-LFA picked.
 
 **Recovery**:
 
