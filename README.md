@@ -25,8 +25,6 @@ This lab provides a practical environment for learning and testing core SR-MPLS 
 
 ![Lab topology](images/topology.png)
 
-> **Note**: this diagram predates the current topology (see Network Resources below for the authoritative, current link map) and needs to be regenerated.
-
 ## Network Resources
 
 - Loopback addresses double as router IDs (BGP, IS-IS), allocated from the `172.16.0.0/24` block and follow the format `172.16.0.y/32`, where `y` is assigned per device.
@@ -78,7 +76,7 @@ Dual-homing each PE into two different points on the ring creates two fully disj
 | `pe11–p1–p2–p3–pe12` | 4 | **40** (all default metric 10) |
 | `pe11–p4–p5–p6–pe12` | 4 | **130** (traverses the metric-100 `p5–p6` link) |
 
-These are *not* equal-cost — the `p5–p6` metric-100 bump makes the second path far more expensive, so plain SPF always picks the first and never load-balances across both. That asymmetry is deliberate: it gives the lab a "good" path and a path SPF will never choose on its own, which is precisely what constraint-based selection (Flex-Algo affinity, SR-TE) exists to override.
+This asymmetry gives the lab a "good" path and a path SPF will never choose on its own, which is precisely what constraint-based selection (Flex-Algo affinity, SR-TE) exists to override.
 
 ### Link Affinities
 
@@ -99,8 +97,6 @@ interface eth1
 exit
 ```
 
-> **Version note**: FRR's current online docs describe an interface-level `isis affinity flex-algo NAME` command. That command **does not exist in FRR 10.7.1** (this lab's pinned image) — the `interface` node has no affinity command at all, and `vtysh -b` silently drops the line at startup. `link-params` → `affinity` is the working path on 10.7.1.
-
 | Affinity | Links (both ends colored) |
 |---|---|
 | RED  | `pe11:eth1↔p1:eth1`, `p1:eth2↔p2:eth1`, `p2:eth2↔p3:eth1`, `p3:eth4↔pe12:eth2` |
@@ -114,7 +110,7 @@ Kept disjoint to avoid collisions:
 
 | Purpose | Range | Mechanism |
 |---|---|---|
-| SRGB (IS-IS Prefix-SID, identical on every SR node) | 16000–23999 | `segment-routing global-block 16000 23999` |
+| SRGB (IS-IS Prefix-SID, all SR nodes) | 16000–23999 | FRR default — **not** explicitly configured |
 | pathd SR-TE binding-SIDs (static) | 30000–30099 | `binding-sid` under `policy color ...` |
 | zebra dynamic label pool (BGP `label vpn export auto`) | 700000–799999 | `mpls label dynamic-block 700000 799999` |
 
@@ -153,7 +149,7 @@ This lab demonstrates SR-MPLS as the transport for L3VPN services, using IS-IS-d
 
 ### SR-MPLS Setup
 
-- **SRGB**: every SR-capable node (pe11, pe12, p1–p6, bdr13) configures the identical `segment-routing global-block 16000 23999` under `router isis 1`, plus `segment-routing on` and `segment-routing node-msd 8`.
+- **SRGB**: no `segment-routing global-block` is configured anywhere — every SR-capable node (pe11, pe12, p1–p6, bdr13) uses FRR's **default** SRGB of `16000–23999`, so label = `16000 + index`. Each node sets `segment-routing on` and `segment-routing node-msd 8`.
 - **Prefix-SID**: each SR-capable node advertises its loopback with `segment-routing prefix <loopback>/32 index <N>` (see the table above for the index/label mapping — label = SRGB base + index).
 - **No encapsulation-behavior required**: the underlay LSP toward a remote PE's loopback comes purely from IS-IS SR, and VPN traffic rides it via an ordinary imposed VPN label.
 
@@ -165,7 +161,56 @@ Every ISIS interface on every SR-capable node (`pe11`, `pe12`, `p1`–`p6`, `bdr
 isis fast-reroute ti-lfa level-2 node-protection link-fallback
 ```
 
-`rr14` is excluded — it has no `segment-routing on` and no SR dataplane role. Node-protection is the primary mode (protects against the *next router* failing, not just the link to it); `link-fallback` still computes a link-protecting repair path for any destination where node-protection isn't computable. Repair paths are precomputed continuously, so failover on a link/node failure is a local, sub-second decision — it doesn't wait for IS-IS to flood the failure and recompute SPF domain-wide. See [VALIDATION.md](VALIDATION.md) Layer 4 for steady-state and live failover verification.
+`rr14` is excluded — it has no `segment-routing on` and no SR dataplane role. Node-protection is the primary mode (protects against the *next router* failing, not just the link to it); `link-fallback` still computes a link-protecting repair path for any destination where node-protection isn't computable. Repair paths are precomputed continuously, so failover on a link/node failure is a local, sub-second decision — it doesn't wait for IS-IS to flood the failure and recompute SPF domain-wide.
+
+The repair path is built from a transit node SID followed by **adjacency SIDs**, which is what makes it a strict path — it can't loosely reroute back over a link it just traversed the way a hand-built node-SID-only segment list can. Node protection is observable too; failing `pe11`'s link to `p1` produces a repair that avoids `p1` entirely rather than just the failed link.
+
+#### Testing TI-LFA requires deliberately slowing SPF
+
+Default reconvergence is **too fast to observe**. Detection, backup activation, and the PLR's own SPF recomputation are all local — the PLR never waits to hear from another node — so the repair window is tens of milliseconds and usually carries zero packets. That's exactly the behaviour you want in production, but it means a naive test can't distinguish TI-LFA from ordinary SPF reconvergence: at 1 pps both show zero loss.
+
+The technique that works is to keep detection instant but delay SPF on the PLR (RFC 8405, milliseconds), so the precomputed backup stays in the forwarding path long enough to see:
+
+```text
+router isis 1
+ spf-delay-ietf init-delay 30000 short-delay 30000 long-delay 30000 holddown 60000 time-to-learn 30000
+```
+
+With that applied, a packet capture on the backup egress shows the multi-label repair stack for the whole delay window, then a clean switch to the single-label post-convergence path. This is a **lab instrument, not lab configuration** — it is applied temporarily during a test and removed afterward. Full procedure in [VALIDATION.md](VALIDATION.md) Layer 4.
+
+### Flex-Algo — intended design, NOT configured (blocked upstream)
+
+Flex-Algo is **not present in this lab's configuration**. It was built, tested, and removed after confirming it cannot work here. The link colouring above stays in place — it's functional and independently useful — but nothing currently consumes it inside the IGP.
+
+**Why it's blocked**: [FRR issue #20022](https://github.com/FRRouting/frr/issues/20022), open and unfixed, with no maintainer response and no identified root cause. Flex-Algo does not work in an `is-type level-2-only` IS-IS domain: configuration is accepted at runtime, but the Flex-Algo Definition is never advertised or elected and per-algorithm node SID labels are never distributed. `show isis flex-algo` reports `Source: Not found` on every node. Confirmed upstream on 10.1.1 and 10.4.1; reproduced here on 10.7.1.
+
+**The design that should work**, recorded for when the bug is fixed:
+
+| Algo | Plane | Participants | Constraint | Metric |
+|---|---|---|---|---|
+| 128 | RED  | pe11, p1, p2, p3, pe12 | `affinity include-any RED`  | igp |
+| 129 | BLUE | pe11, p4, p5, p6, pe12 | `affinity include-any BLUE` | igp |
+
+Per participating node, under `router isis 1`:
+
+```text
+flex-algo 128
+ advertise-definition
+ dataplane sr-mpls
+ affinity include-any RED
+ metric-type igp
+exit
+!
+segment-routing prefix 172.16.0.11/32 algorithm 128 index 211
+```
+
+Per-algo Prefix-SID index would be `200 + last loopback octet` for algo 128 and `300 + octet` for algo 129 — making `pe12` reachable as label **16212** via the RED plane and **16312** via the BLUE plane, alongside its algo-0 label 16112. All participants advertise an identical FAD at equal priority, so whichever definition wins election is the same one. `bdr13`/`rr14` would participate in neither, leaving `bdr13`'s loopback reachable only via algo 0.
+
+Additional notes:
+
+- **`mpls-te on` under `router isis 1` is a hard prerequisite**. It's what makes IS-IS flood the admin-group/ASLA sub-TLVs that affinity constraints match against — without it there are no admin-groups in the LSDB at all and `include-any RED` would match nothing.
+- **`metric-type igp` is FRR's default and never appears in `show running-config`.** Its absence is not a rejection. FRR also only *implements* the IGP metric type — `te`/`delay` are advertised but disable the algorithm locally.
+- FRR mislabels algorithms 128–255 as `"Strict SPF"` in `segmentRoutingAlgorithm` output (1 is actually Strict SPF). Cosmetic only.
 
 ### BGP L3VPN Setup
 

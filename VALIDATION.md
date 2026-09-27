@@ -89,20 +89,28 @@ Expect `affinity-map RED bit-position 0` / `affinity-map BLUE bit-position 1` pl
 
 **This grep is the actual test.** FRR silently discards unrecognized interface commands during `vtysh -b`, so a coloring mistake shows up as *nothing at all* in the running config rather than an error. If `affinity` lines are missing here but present in `frr.conf`, the syntax is being rejected — note that `isis affinity flex-algo NAME` (in FRR's current online docs) does **not** exist in 10.7.1 and will vanish exactly this way.
 
+Then confirm they're actually **advertised** — the colouring being in the local config doesn't mean IS-IS is flooding it. The LSDB is where this is visible; `show isis interface detail` does *not* display the admin-group:
+
 ```shell
-docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show isis interface detail"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show isis database detail" | grep -iE "Admin Group|Ext Admin Group"
 ```
 
-Check the admin-group/affinity attribute on `eth1` and `eth2` (both RED on `p1`). Expected coloring, both ends of each link:
+```shell
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show isis database json"   # extendedAdminGroup / asla per extReach entry
+```
 
-| Affinity | Links |
-|---|---|
-| RED  | `pe11:eth1↔p1:eth1`, `p1:eth2↔p2:eth1`, `p2:eth2↔p3:eth1`, `p3:eth4↔pe12:eth2` |
-| BLUE | `pe11:eth2↔p4:eth2`, `p4:eth3↔p5:eth1`, `p5:eth2↔p6:eth2`, `p6:eth3↔pe12:eth1` |
+Expected values — `0x1` = RED (bit-position 0), `0x2` = BLUE (bit-position 1), advertised in both the legacy admin-group and the ASLA (`standardApp: 0x10`) encodings:
 
-Cross-links (`p1↔p4`, `p2↔p5`, `p3↔p6`) and the `rr14`/`bdr13` attachments should show **no** affinity — that's deliberate, so a constrained Flex-Algo can't hop between the RED and BLUE planes mid-path.
+| Affinity | Value | Links (both ends colored) |
+|---|---|---|
+| RED  | `0x1` | `pe11:eth1↔p1:eth1`, `p1:eth2↔p2:eth1`, `p2:eth2↔p3:eth1`, `p3:eth4↔pe12:eth2` |
+| BLUE | `0x2` | `pe11:eth2↔p4:eth2`, `p4:eth3↔p5:eth1`, `p5:eth2↔p6:eth2`, `p6:eth3↔pe12:eth1` |
 
-Nothing consumes these affinities yet (no Flex-Algo Definition is configured), so this layer only confirms the coloring is advertised correctly. Also worth confirming at first deploy: whether the advertised admin-group shows up without `mpls-te on` under `router isis` — FRR's docs don't state a dependency either way for flex-algo affinities.
+Cross-links (`p1↔p4`, `p2↔p5`, `p3↔p6`) and the `rr14`/`bdr13` attachments must show **no** admin-group at all — not `0x0`, genuinely absent. That's FRR's `admin-group-send-zero` default behaving correctly, and it's what keeps the two planes from being bridgeable by a constraint that matches "any colour".
+
+**If no admin-groups appear anywhere**, the cause is a missing `mpls-te on` under `router isis 1` — that's the knob that makes isisd flood TE sub-TLVs, and without it the colouring is inert regardless of how the interfaces are configured. It's present on all 8 nodes with colored links for exactly this reason.
+
+Nothing in the IGP consumes these affinities today (Flex-Algo is not configured — see below). This layer confirms the colouring is correctly advertised so it's ready for a consumer, whether that ends up being Flex-Algo upstream-fixed or `pola`'s TED via BGP-LS.
 
 ---
 
@@ -132,6 +140,12 @@ docker exec -it clab-frr-sr-mpls-p1 ip -f mpls route show
 
 Should be non-empty, mirroring `show mpls table` in FRR.
 
+### Flex-Algo — not configured
+
+There is nothing to validate here. Flex-Algo is deliberately absent from this lab: it cannot work in an `is-type level-2-only` domain on FRR 10.7.1 ([FRR #20022](https://github.com/FRRouting/frr/issues/20022), open and unfixed). It was configured, proven broken, and removed. `show isis flex-algo` will return nothing, and `show isis topology` will only ever report `"algorithm":0` — both are expected.
+
+See README's Flex-Algo section for the intended design and the symptoms to expect if it's ever re-enabled.
+
 ---
 
 ## Layer 4 — TI-LFA fast reroute
@@ -152,38 +166,58 @@ docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show isis route backup"
 
 Look for `pe12`'s loopback (`172.16.0.12/32`) showing both a primary and a backup/repair nexthop.
 
-**Failover** — `pe11` is dual-homed (`p1` and `p4`), giving two disjoint 4-hop paths to `pe12`, but they are **not** equal-cost: `p1-p2-p3` costs 40, `p4-p5-p6` costs 130 (it crosses the metric-100 `p5–p6` link). SPF always picks `p1-p2-p3`, so `p2↔p3` is reliably on the active path. Confirm before failing anything:
+### Observing an actual failover — you must stall SPF first
+
+**Default reconvergence is far too fast to catch.** Everything in the repair sequence is local to the point of local repair (PLR): link-down detection is an instant carrier/admin event, backup activation is a FIB swap to an already-computed nexthop, and the PLR's SPF recomputes from its own LSDB without waiting to hear from any other node. The repair window is tens of milliseconds and typically carries **zero packets**.
+
+That's exactly what you want operationally — but it means a naive test proves nothing. Two specific traps:
+
+- **A 1 pps `ping` showing zero loss is not evidence of TI-LFA.** Plain SPF reconvergence in a lab this size would also drop zero packets at that rate. Both outcomes look identical.
+- **Adding latency with `tc`/netem does not widen the window.** It adds *packet* latency, not *convergence* latency. It delays LSP flooding to remote nodes but changes nothing about the PLR's own detect→repair→reconverge sequence.
+- Worse, `tc qdisc ... netem loss 100%` leaves the interface **UP**, so there is no link-down event, TI-LFA never activates at all, and traffic blackholes for the full IS-IS hold time (`hello 3 × holddown 10` ≈ 30s). That looks like TI-LFA failing when it was never invoked.
+
+The working technique is to keep detection instant but stop the PLR from replacing the backup so quickly — delay SPF (RFC 8405, values in milliseconds). On the PLR only:
 
 ```shell
-docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 172.16.0.12/32"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "configure terminal" -c "router isis 1" \
+  -c "spf-delay-ietf init-delay 30000 short-delay 30000 long-delay 30000 holddown 60000 time-to-learn 30000"
 ```
 
-Start continuous client traffic, then fail the link:
+`init-delay` is the operative knob — the delay before the first SPF after a topology change. The TI-LFA backup activates instantly on link-down and then **stays** the active forwarding path for that whole window.
+
+Baseline the repair path, then run the test:
 
 ```shell
-docker exec -it clab-frr-sr-mpls-c1 ping 10.10.2.2
-```
-```shell
-docker exec -it clab-frr-sr-mpls-p2 vtysh -c "configure terminal" -c "interface eth2" -c "shutdown"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 99.99.99.99 json"
 ```
 
-**Expected with TI-LFA working**: at most one or two dropped pings (sub-second local repair) — not the multi-second gap you'd see waiting for IS-IS to fully reconverge (flood LSPs, recompute SPF domain-wide). The local repair happens at the point of local repair — `p2` itself, the node directly upstream of the failed link — so confirm there first:
+Note the `backupNexthops` label stack (a multi-label repair stack via `eth2`) versus the single-label primary via `eth1`.
 
 ```shell
-docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show ip route 172.16.0.12/32"
-docker exec -it clab-frr-sr-mpls-p2 vtysh -c "show mpls table"
+# terminal 1 — watch the backup egress
+sudo ip netns exec clab-frr-sr-mpls-pe11 tcpdump -nni eth2 -ttt mpls
+
+# terminal 2
+docker exec -it clab-frr-sr-mpls-c3 ping -i 0.2 99.99.99.99
+
+# terminal 3 — trigger
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "configure terminal" -c "interface eth1" -c "shutdown"
 ```
 
-Should reflect a repair nexthop other than the now-dead `eth2` immediately after the shutdown — read the actual alternate off the output rather than assuming which one TI-LFA picked.
+**What proves it**: packets egress `eth2` carrying the **multi-label repair stack** (transit node SID on top, then adjacency SIDs) for the full SPF-delay window, then switch to the **single** label `16113` once SPF finally runs and installs a new primary. That 4-labels→1-label transition is TI-LFA carrying traffic and then handing off. Mid-window the RIB shows it too — the backup nexthop marked installed/`fib` while the dead primary is still listed.
 
-**Recovery**:
+**Recovery, and remove the test instrument**:
 
 ```shell
-docker exec -it clab-frr-sr-mpls-p2 vtysh -c "configure terminal" -c "interface eth2" -c "no shutdown"
-docker exec -it clab-frr-sr-mpls-p1 vtysh -c "show ip route 172.16.0.12/32"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "configure terminal" -c "interface eth1" -c "no shutdown"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "configure terminal" -c "router isis 1" -c "no spf-delay-ietf"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 99.99.99.99 json"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show isis fast-reroute summary"
 ```
 
-Confirm it settles back onto the original primary path via `p2` once IS-IS reconverges normally, and `show isis fast-reroute summary` on `p1` shows coverage restored.
+Confirm the primary settles back onto `eth1` and `backupNexthops` reappears. Note that while `eth1` is down, `pe11` is effectively single-homed for that destination and correctly has **no** backup — there's no alternate left to compute, which is right rather than broken.
+
+The SPF delay is a lab instrument only — a 30s delay is pathological in production. If you want a permanent, less disruptive demo hook, `spf-delay-ietf init-delay 5000` is enough to be observable.
 
 ---
 
@@ -327,7 +361,7 @@ make clean
 | 1 | `sysctl net.mpls.conf.*.input` | all `= 1` (skip `rr14` — no SR role) |
 | 2 | `show isis neighbor` | all expected adjacencies `Up`, per the map above |
 | 3 | `show mpls table` | one label per remote SR loopback (9 nodes) |
-| 4 | `show isis fast-reroute summary` | non-zero LFA coverage; failover test shows ≤2 dropped pings |
+| 4 | `show isis fast-reroute summary` | non-zero LFA coverage; failover test shows the multi-label repair stack on the wire (requires stalling SPF — packet loss alone proves nothing) |
 | 5 | `show bgp summary` | RR (`rr14`) sessions to `pe11`/`pe12`/`bdr13` `Established` |
 | 6 | `show bgp ipv4 vpn` | RD/RT/label present both PEs |
 | 7 | `ping` c1↔c2 RED+BLUE, v4+v6 | 0% loss |
