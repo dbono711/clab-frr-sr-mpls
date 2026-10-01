@@ -10,18 +10,6 @@ topology:
       image: quay.io/frrouting/frr:10.7.1
   nodes:
 
-    # PATH COMPUTATION ELEMENT
-    ## pola (https://github.com/nttcom/pola)
-    pola:
-      kind: linux
-      image: ghcr.io/nttcom/pola:v1.3.3
-      mgmt-ipv4: 172.28.1.20
-      binds:
-        - pola/polad.yaml:/pola/polad.yaml
-        - pola/pola-logs:/var/log/pola
-        - pola/sr-policies:/pola/sr-policies
-      cmd: polad -f /pola/polad.yaml
-
     # PROVIDER EDGE
     ## pe11
     pe11:
@@ -155,6 +143,27 @@ topology:
         - rr14/rr14.sh:/config/rr14.sh
       exec:
         - bash /config/rr14.sh
+
+    # PATH COMPUTATION ELEMENT
+    ## pola (https://github.com/nttcom/pola)
+    pola:
+      kind: linux
+      image: ghcr.io/nttcom/pola:v1.3.3
+      mgmt-ipv4: 172.28.1.20
+      binds:
+        - pola/polad.yaml:/pola/polad.yaml
+        - pola/pola-logs:/var/log/pola
+        - pola/sr-policies:/pola/sr-policies
+      cmd: polad -f /pola/polad.yaml
+
+    # TED COLLECTOR
+    ## gobgp — BGP-LS collector feeding pola's TED
+    gobgp:
+      kind: linux
+      image: jauderho/gobgp:latest
+      mgmt-ipv4: 172.28.1.21
+      binds:
+        - gobgp/gobgp.toml:/config/gobgp.toml
 
     # CLIENTS
     ## c1

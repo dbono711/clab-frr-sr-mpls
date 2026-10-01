@@ -52,6 +52,6 @@ inspect:
 p1 p2 p3 p4 p5 p6 pe11 pe12 rr14 bdr13:
 	$(call exec_vtysh,$(subst -,_,$@))
 
-.PHONY: c1 c2 c3 pola
-c1 c2 c3 pola:
+.PHONY: c1 c2 c3 pola gobgp
+c1 c2 c3 pola gobgp:
 	$(call exec_shell,$(subst -,_,$@))

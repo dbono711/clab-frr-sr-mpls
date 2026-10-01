@@ -1,0 +1,12 @@
+[global.config]
+  as = 65000
+  router-id = "172.28.1.21"
+
+# pe11 — the only BGP-LS originator.
+[[neighbors]]
+  [neighbors.config]
+    peer-as = 65000
+    neighbor-address = "172.28.1.11"
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ls"

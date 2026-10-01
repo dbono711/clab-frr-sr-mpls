@@ -8,6 +8,17 @@ global:
   log:
     path: "/var/log/pola/"
     name: "polad.log"
+  # TED is left ENABLED so this works the moment the upstream gap closes, but it
+  # is currently non-functional: FRR 10.7.1's BGP-LS encoder omits Prefix-SIDs,
+  # so pola receives the SRGB but never the per-prefix index and cannot build a
+  # label stack. Expect `pola ted` to be empty. See README "BGP-LS / TED" for the
+  # validation commands and what a working feed should look like.
   ted:
-    enable: false
+    enable: true
+    source: "gobgp"
+    asn: 65000
+  gobgp:
+    grpcClient:
+      address: "172.28.1.21"
+      port: 50051
   usidMode: false

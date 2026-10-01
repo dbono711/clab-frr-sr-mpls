@@ -4,7 +4,7 @@
 
 A Segment Routing MPLS (SR-MPLS) network using [CONTAINERlab](https://containerlab.dev/) and [FRRouting (FRR)](https://frrouting.org/) nodes to demonstrate [SR-MPLS](https://docs.frrouting.org/en/latest/isisd.html#segment-routing) capabilities in a controlled lab environment.
 
-This lab provides a practical environment for learning and testing core SR-MPLS concepts including the SRGB, IS-IS Prefix-SIDs, SR-MPLS transport for (IPv4 + IPv6) BGP L3VPN services, global-table BGP transport riding the same SR-MPLS underlay, and a live PCEP session to an external PCE ([`pola`](https://github.com/nttcom/pola)) as the foundation for SR-TE policy control.
+This lab provides a practical environment for learning and testing core SR-MPLS concepts including the SRGB, IS-IS Prefix-SIDs, SR-MPLS transport for BGP L3VPN services (IPv4 forwarding end-to-end; the IPv6 control plane is exercised but cannot install — see "IPv6 in the VRFs"), global-table BGP transport riding the same SR-MPLS underlay, and a live PCEP session to an external PCE ([`pola`](https://github.com/nttcom/pola)) as the foundation for SR-TE policy control.
 
 ## Requirements
 
@@ -30,7 +30,7 @@ This lab provides a practical environment for learning and testing core SR-MPLS 
 - Loopback addresses double as router IDs (BGP, IS-IS), allocated from the `172.16.0.0/24` block and follow the format `172.16.0.y/32`, where `y` is assigned per device.
 - All routers are part of IS-IS Level 2 with IS-IS NET addresses derived from the router ID, using the format `49.0001.1721.6000.00yy.00`, where `yy` is the loopback's last octet zero-padded to 4 digits (e.g., `49.0001.1721.6000.0011.00` for pe11).
 - BGP is configured on the PEs (pe11, pe12), the border router (bdr13), and the route reflector (rr14) — all ASN 65000.
-- `pe11`, `pe12`, and `rr14` each carry an extra `ipv6 address ::ffff:172.16.0.y/128` on `lo` alongside the IPv4 loopback — an IPv4-mapped IPv6 address, not advertised into ISIS. Two independent reasons it has to look exactly like this: (1) FRR refuses to negotiate `address-family ipv6 vpn` (needed for the BLUE/RED VRFs' IPv6 side) with **zero** local IPv6 addresses present anywhere on the router, failing the *entire* session (`Cease/Unspecific`) rather than just that AF; and (2) the same address becomes the actual vpnv6 `next-hop-self` value advertised to peers, and only the IPv4-mapped form is resolvable by zebra (via the embedded IPv4 address, matched against the IPv4 RIB) — a native/arbitrary IPv6 address here is a valid-looking BGP path that can never be installed, since there's no real IPv6 anywhere in this underlay to resolve it against. `bdr13` never activates `ipv6 vpn`, so it doesn't need one.
+- `pe11`, `pe12`, and `rr14` each carry an `ipv6 address 2001:db8::y/128` on `lo` alongside the IPv4 loopback — **unrouted, deliberately not advertised into IS-IS**, and present for exactly one reason: FRR refuses to negotiate `address-family ipv6 vpn` (which all three activate, for the RED/BLUE VRFs' IPv6 side) with **zero** local IPv6 addresses anywhere on the router, failing the *entire* session with `Cease/Unspecific` rather than just that AF. It is a session-enablement placeholder and nothing more. `bdr13` never activates `ipv6 vpn`, so it doesn't need one.
 
 | Node | Role | Loopback / Router ID | IS-IS NET | Prefix-SID Index | Label |
 |---|---|---|---|---|---|
@@ -220,6 +220,56 @@ Additional notes:
 - **Per-AF Label Model**: `label vpn export auto` is configured inside **each** `address-family ipv4 unicast` / `ipv6 unicast` block (not at the vrf-instance level — FRR requires it nested under the AF, same as `rd vpn export`). FRR/zebra dynamically allocates one MPLS VPN label per AF per VRF (drawn from the `700000–799999` dynamic pool) — so RED gets two labels (one for its IPv4 side, one for IPv6).
 - **End-to-End Service**: BGP L3VPN exchanges routes between matching VRFs on the PEs via the route reflector (`rr14`), while the SR-MPLS underlay (IS-IS Prefix-SID LSPs) provides the data-plane transport across the core.
 
+### IPv6 in the VRFs (6VPE) — control plane works, dataplane blocked by the Linux kernel
+
+**Status: parked.** The RED/BLUE IPv6 configuration on the
+client-PE side is deliberately retained and fully functional up to the point of route installation —
+`ping6` between `c1` and `c2` does not work and is not expected to. The configuration stays because
+it is correct; what fails is below FRR.
+
+What does work: `pe12` originates `2001:c0de:10:2::/64` from VRF RED, exports it to vpnv6 with a VPN
+label, `rr14` reflects it, and `pe11` receives it and imports it into VRF RED. Verifiable at every
+step with `show bgp ipv6 vpn` / `show bgp vrf RED ipv6 unicast`. The entire BGP/MPLS L3VPN control
+plane for IPv6 is exercised and provable.
+
+What fails: the route never reaches `show ipv6 route vrf RED`, because there is no way to express its
+forwarding entry on Linux.
+
+**Root cause — Linux cannot install an IPv6 route with an IPv4 next-hop.** Proper 6VPE (RFC 4659)
+and 6PE (RFC 4798) both carry an IPv4-mapped next-hop so the IPv6 service route resolves recursively through the IPv4 underlay — that is the entire point, and it is what keeps
+the core IPv4-only. FRR does this correctly. The kernel then refuses the result outright:
+
+```
+# ip -6 route add 2001:c0de:10:2::/64 encap mpls 16112/700003 via inet 10.0.1.1 dev eth1
+Error: IPv6 does not support RTA_VIA attribute.
+```
+
+`net/ipv6/route.c` rejects `RTA_VIA` unconditionally: an `AF_INET6` route cannot name a non-IPv6
+gateway, whatever encapsulation it carries. The symptom in FRR is a route that looks completely
+correct and is marked `B>r` (rejected), with `Route install failed` and `RTM_NEWROUTE ... Invalid
+argument` in the log. Cisco and Juniper do this in hardware; Linux has no expression for it, and no
+amount of FRR configuration can supply a missing netlink attribute.
+
+The same command with an **IPv6** next-hop is accepted, and forwards correctly over the unmodified
+
+IPv4-only core:
+
+```
+# ip -6 route add 2001:c0de:10:2::/64 encap mpls 16112/700003 via inet6 fe80::a8c1:abff:fe30:f964 dev eth1 vrf RED
+# ...ping6 from c1 to c2 then succeeds
+```
+
+So the blocker is specifically the mixed address family, not MPLS encapsulation on IPv6 routes, and
+not the label stack, which FRR had already computed correctly.
+
+#### A testing trap worth recording
+
+FRR selects the local vpnv6 next-hop **at session establishment and caches it**. Changing `lo`
+addresses, or applying an outbound `set ipv6 next-hop global` route-map, on a running `bgpd` does not
+recompute it — even after `clear bgp ipv6 vpn * soft out`, which re-sends the attribute without
+recomputing the cached local value. **Verify vpnv6 next-hop behaviour on a fresh `make lab`, never on a
+live edit.**
+
 ## Global Table: Plain BGP over the SR-MPLS Underlay
 
 `pe11` originates the client3-connected subnet `10.11.1.0/30`, and `bdr13` originates the simulated Internet loopback `99.99.99.99/32` — both under a plain `address-family ipv4 unicast` `network` statement in the **default** BGP instance, with `neighbor RR activate` / `next-hop-self` toward `rr14`. There is no VRF, and no BGP Labeled-Unicast (RFC 3107) involved.
@@ -250,9 +300,7 @@ segment-routing
     peer POLA
 ```
 
-`pola` runs with its own TED disabled (`ted.enable: false` in `pola/polad.yaml`) — it is not currently computing dynamic paths from a live topology feed. `pe11` is the only node in the lab running `pathd`/carrying this configuration; no other PE or core node participates.
-
-**Current state**: this is the PCEP session/plumbing only — as of this writing, no `segment-list`/`policy` blocks exist in `pe11/frr.conf`, and no live, correctly-targeted SR policy has been provisioned through `pola`. See **Discrepancies** below.
+`pe11` is the only node running `pathd`/carrying this configuration; no other PE or core node participates.
 
 Verify the PCEP session itself:
 
@@ -261,6 +309,43 @@ docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show sr-te pcep session"
 docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show sr-te pcep pcc"
 docker exec -it clab-frr-sr-mpls-pola pola session list
 ```
+
+### BGP-LS / TED — built, proven, and parked
+
+A full BGP-LS feed into a `gobgp` collector is configured and **works end to end**, but the data FRR sends is unusable for SR-MPLS path computation. Do not debug this as a config problem.
+
+The pipeline: `pe11` → `mpls-te export` → zebra ZAPI opaque link-state → bgpd `address-family link-state link-state` → BGP-LS session → `gobgp` (172.28.1.21) → gRPC → pola.
+
+```text
+router isis 1
+ mpls-te on
+ mpls-te export
+exit
+!
+router bgp 65000
+ neighbor 172.28.1.21 remote-as internal
+ address-family link-state link-state
+  neighbor 172.28.1.21 activate
+ exit-address-family
+exit
+```
+
+**What works**: 50+ NLRIs reach `gobgp` — node, link and prefix — carrying node names, IS-IS area, router IDs, per-node **SR Capabilities (SRGB `16000:24000`)**, IGP metrics and bandwidth.
+
+**The blocker — FRR 10.7.1's BGP-LS encoder omits the Prefix-SID.** Every PREFIXv4 NLRI arrives with an empty attribute set (`"prefix":{}` in `gobgp global rib -a ls -j`), including every loopback. A label is `SRGB base + index`; pola receives the base and never the index, so it cannot construct a label stack for any destination. Dynamic SR-MPLS path computation is therefore **not achievable on this FRR version**, regardless of configuration.
+
+Two further encoder defects found while proving this:
+
+- **Admin-groups and adjacency-SIDs are not encoded either.** Link NLRIs carry only `igp_metric`, `bandwidth`, `reservable_bandwidth`, `unreserved_bandwidth`. The `Ext Admin Group: 0x1/0x2` present in `show isis mpls-te database` never reaches BGP-LS, so affinity-constrained PCE-side computation is also out.
+- **Link metric is corrupted in transit.** `p5↔p6` is configured `isis metric 100` and appears correctly as `Metric: 100` in the TED, but arrives as `"igp_metric":36` over BGP-LS.
+
+Two design notes worth keeping:
+
+- **`mpls-te export` exports the full LSDB**. `mpls-te export` on `pe11` produced all 50+. This also means the core does **not** need `bgpd` enabled on P routers; one exporter covers the whole topology. (The command is mutually exclusive with `distribute link-state`.)
+
+Consequence for pola generally: both routes to using it are currently blocked. Dynamic paths need the TED, which needs Prefix-SIDs FRR doesn't send. Explicit paths don't need the TED but require `pola sr-policy add -s`, and that flag is broken in pola v1.3.3 — `addSRPolicyWithoutSIDValidation()` sets neither `Asn` nor `SidValidate`, so the request still lands in the TED-requiring server branch. Using pola requires either an FRR BGP-LS fix or a one-line pola patch.
+
+`ted.enable` is deliberately left **true** in `pola/polad.yaml` so the feed starts working the moment the upstream gap closes. [VALIDATION.md](VALIDATION.md) Layer 9 carries a revisit checklist — the exact commands, with what a *working* feed should return in each one alongside what 10.7.1 currently returns.
 
 ## Deployment
 

@@ -38,3 +38,7 @@ ip link set dev eth3.20 master BLUE
 # new VRF is created or the system restarts, which prevents FRR
 # from installing VRF routes correctly
 sysctl -w net.vrf.strict_mode=1
+
+# Enable IPv6 forwarding for the client-facing VRF subinterfaces; off by default in
+# the container netns and not set by FRR or containerlab
+sysctl -w net.ipv6.conf.all.forwarding=1
