@@ -49,7 +49,7 @@ This lab provides a practical environment for learning and testing core SR-MPLS 
 
 ### Core (Underlay) Topology
 
-Six core routers (`p1`–`p6`) form a ring (`p1—p2—p3—p6—p5—p4—p1`) with one diagonal chord (`p2—p5`). `p2—p5` and `p5—p6` both carry an `isis metric 100` bump on both ends, biasing SPF away from that side of the ring. All links are IPv4 `/31`s (RFC 3021), packed sequentially within a single `10.0.1.0/24` block:
+Six core routers (`p1`–`p6`) form a ring (`p1—p2—p3—p6—p5—p4—p1`) with three cross-links (`p1—p4`, `p2—p5`, `p3—p6`). `p2—p5` and `p5—p6` both carry an `isis metric 100` bump on both ends, biasing SPF away from that side of the ring. All links are IPv4 `/31`s (RFC 3021), packed sequentially within a single `10.0.1.0/24` block:
 
 | Link | Subnet | IS-IS Metric |
 |---|---|---|
@@ -161,7 +161,7 @@ Every ISIS interface on every SR-capable node (`pe11`, `pe12`, `p1`–`p6`, `bdr
 isis fast-reroute ti-lfa level-2 node-protection link-fallback
 ```
 
-`rr14` is excluded — it has no `segment-routing on` and no SR dataplane role. Node-protection is the primary mode (protects against the *next router* failing, not just the link to it); `link-fallback` still computes a link-protecting repair path for any destination where node-protection isn't computable. Repair paths are precomputed continuously, so failover on a link/node failure is a local, sub-second decision — it doesn't wait for IS-IS to flood the failure and recompute SPF domain-wide.
+Node-protection is the primary mode (protects against the *next router* failing, not just the link to it); `link-fallback` still computes a link-protecting repair path for any destination where node-protection isn't computable. Repair paths are precomputed continuously, so failover on a link/node failure is a local, sub-second decision — it doesn't wait for IS-IS to flood the failure and recompute SPF domain-wide.
 
 The repair path is built from a transit node SID followed by **adjacency SIDs**, which is what makes it a strict path — it can't loosely reroute back over a link it just traversed the way a hand-built node-SID-only segment list can. Node protection is observable too; failing `pe11`'s link to `p1` produces a repair that avoids `p1` entirely rather than just the failed link.
 
@@ -208,9 +208,77 @@ Per-algo Prefix-SID index would be `200 + last loopback octet` for algo 128 and 
 
 Additional notes:
 
-- **`mpls-te on` under `router isis 1` is a hard prerequisite**. It's what makes IS-IS flood the admin-group/ASLA sub-TLVs that affinity constraints match against — without it there are no admin-groups in the LSDB at all and `include-any RED` would match nothing.
+- **`mpls-te on` under `router isis 1` is a hard prerequisite**. It's what makes IS-IS flood the admin-group/ASLA sub-TLVs that affinity constraints match against — without it there are no admin-groups in the LSDB at all and `include-any RED`, for example, would match nothing. This configuration will remain in the lab configuration.
 - **`metric-type igp` is FRR's default and never appears in `show running-config`.** Its absence is not a rejection. FRR also only *implements* the IGP metric type — `te`/`delay` are advertised but disable the algorithm locally.
 - FRR mislabels algorithms 128–255 as `"Strict SPF"` in `segmentRoutingAlgorithm` output (1 is actually Strict SPF). Cosmetic only.
+
+#### Steering RED and BLUE onto their planes
+
+Per-algo SIDs on their own carry no traffic — something has to pick 16212 over 16112 for a given VPN route. FRR 10.7.1 has **no native "bind VRF to algo" knob**: no per-VRF algorithm, no automatic color→algo mapping. Steering is done with an **SR-TE policy whose segment-list is a single label — the remote PE's per-algo Prefix-SID** — and BGP colors each VRF's routes to match that policy. The segment uses a raw `mpls label`, not `nai prefix ... algorithm`, because pathd's NAI only accepts algorithm 0/1, never 128–255. The color is stamped on ingress with `route-map vpn import` + `set sr-te color` under the VRF's `address-family ipv4 unicast`; the policy key is (color, endpoint), where endpoint is the VPN route's BGP next-hop (the remote PE loopback). Color = algo number (128/129) purely as a mnemonic. Binding-SIDs come from the reserved `30000–30099` range — `30010` (RED) / `30011` (BLUE). IPv4 only: IPv6-in-VRF is parked (see 6VPE below), so no `ipv6 unicast` route-map. It's one policy per VRF per remote PE, so it scales as VRFs × PEs — fine for two PEs, a real cost in a larger mesh.
+
+On `pe11`, alongside the existing `pcep` block:
+
+```text
+segment-routing
+ traffic-eng
+  ...
+  segment-list SL-ALGO128-TO-PE12
+   index 10 mpls label 16212
+  exit
+  segment-list SL-ALGO129-TO-PE12
+   index 10 mpls label 16312
+  exit
+  policy color 128 endpoint 172.16.0.12
+   name RED-PLANE-TO-PE12
+   binding-sid 30010
+   candidate-path preference 100 name ALGO128 explicit segment-list SL-ALGO128-TO-PE12
+  exit
+  policy color 129 endpoint 172.16.0.12
+   name BLUE-PLANE-TO-PE12
+   binding-sid 30011
+   candidate-path preference 100 name ALGO129 explicit segment-list SL-ALGO129-TO-PE12
+  exit
+ exit
+exit
+!
+route-map RED-ALGO128 permit 10
+ set sr-te color 128
+exit
+!
+route-map BLUE-ALGO129 permit 10
+ set sr-te color 129
+exit
+!
+router bgp 65000 vrf RED
+ address-family ipv4 unicast
+  route-map vpn import RED-ALGO128
+ exit-address-family
+exit
+!
+router bgp 65000 vrf BLUE
+ address-family ipv4 unicast
+  route-map vpn import BLUE-ALGO129
+ exit-address-family
+exit
+```
+
+`pe12` mirrors it for return traffic: endpoint `172.16.0.11`, labels `16211` (algo 128) / `16311` (algo 129), same colors, route-maps and binding-SIDs.
+
+Expected forwarding result on `pe11` toward `pe12`:
+
+| VRF  | Color | Label stack         | First hop   |
+|------|-------|---------------------|-------------|
+| RED  | 128   | `16212` + VPN label | p1 (`eth1`) |
+| BLUE | 129   | `16312` + VPN label | p4 (`eth2`) |
+
+BLUE traversing `p4–p5–p6` despite the metric-100 `p5↔p6` link is the proof — algo 0 never picks that path.
+
+Validation to run once this is buildable:
+
+- `show sr-te policy detail` — both policies `Operational: Up`
+- `show bgp vrf RED ipv4 unicast 10.10.2.0/30` — path carries `SR-TE color 128`
+- `show ip route vrf RED 10.10.2.0/30` / `show ip route vrf BLUE 10.10.2.4/30` — label stacks per the table
+- `tcpdump` on `pe11` `eth1` vs `eth2` while pinging c1→c2 in each VRF
 
 ### BGP L3VPN Setup
 
@@ -262,14 +330,6 @@ IPv4-only core:
 So the blocker is specifically the mixed address family, not MPLS encapsulation on IPv6 routes, and
 not the label stack, which FRR had already computed correctly.
 
-#### A testing trap worth recording
-
-FRR selects the local vpnv6 next-hop **at session establishment and caches it**. Changing `lo`
-addresses, or applying an outbound `set ipv6 next-hop global` route-map, on a running `bgpd` does not
-recompute it — even after `clear bgp ipv6 vpn * soft out`, which re-sends the attribute without
-recomputing the cached local value. **Verify vpnv6 next-hop behaviour on a fresh `make lab`, never on a
-live edit.**
-
 ## Global Table: Plain BGP over the SR-MPLS Underlay
 
 `pe11` originates the client3-connected subnet `10.11.1.0/30`, and `bdr13` originates the simulated Internet loopback `99.99.99.99/32` — both under a plain `address-family ipv4 unicast` `network` statement in the **default** BGP instance, with `neighbor RR activate` / `next-hop-self` toward `rr14`. There is no VRF, and no BGP Labeled-Unicast (RFC 3107) involved.
@@ -282,6 +342,59 @@ Verify with:
 docker exec -it clab-frr-sr-mpls-c3 ping -c 5 99.99.99.99
 docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 99.99.99.99/32"
 docker exec -it clab-frr-sr-mpls-bdr13 vtysh -c "show ip route 10.11.1.0/30"
+```
+
+### Manual SR-TE Steering Example: Pinning the Internet Route to a Custom Path
+
+Plain SPF sends `pe11 → 99.99.99.99` over the cheap `p1-p2-p3` path. An explicit SR-TE policy on `pe11` can force it the long way round instead — `pe11 → p1 → p4 → p5 → p6 → p3 → bdr13` — by listing every hop's Prefix-SID in a segment-list and coloring just that one BGP route to match the policy:
+
+```text
+segment-routing
+ traffic-eng
+  segment-list INTERNET0-CUSTOM
+   index 10 mpls label 16102
+   index 20 mpls label 16105
+   index 30 mpls label 16106
+   index 40 mpls label 16107
+   index 50 mpls label 16104
+   index 60 mpls label 16113
+  exit
+  policy color 100 endpoint 172.16.0.13
+   binding-sid 30000
+   candidate-path preference 100 name INTERNET0-VIA-CUSTOM explicit segment-list INTERNET0-CUSTOM
+  exit
+ exit
+exit
+!
+ip prefix-list INTERNET0 seq 5 permit 99.99.99.99/32
+!
+route-map STEER-INTERNET0-VIA-CUSTOM permit 10
+ match ip address prefix-list INTERNET0
+ set sr-te color 100
+exit
+route-map STEER-INTERNET0-VIA-CUSTOM permit 100
+exit
+!
+router bgp 65000
+ address-family ipv4 unicast
+  neighbor RR route-map STEER-INTERNET0-VIA-CUSTOM in
+ exit-address-family
+exit
+```
+
+How it fits together:
+
+- **Segment-list**: labels are the algo-0 Prefix-SIDs of `p1` (16102), `p4` (16105), `p5` (16106), `p6` (16107), `p3` (16104) and finally `bdr13` (16113) — remember the core routers' loopback octets are offset by one from their names (`p1` = `172.16.0.2`, etc.).
+- **Policy key** is (color 100, endpoint `172.16.0.13`). The endpoint must equal the route's BGP next-hop — `bdr13`'s loopback, thanks to its `next-hop-self` — or the color matches nothing.
+- **Coloring** happens inbound from `rr14`: `permit 10` stamps color 100 on `99.99.99.99/32` only; the empty `permit 100` is the catch-all that lets every other route through uncolored. Without it the implicit deny drops everything else learned from the RR.
+- **Binding-SID** `30000` is the first entry in the reserved static range, clear of the `30010`/`30011` earmarked for the Flex-Algo VRF steering above.
+
+Verify with:
+
+```shell
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show sr-te policy detail"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show bgp ipv4 unicast 99.99.99.99/32"
+docker exec -it clab-frr-sr-mpls-pe11 vtysh -c "show ip route 99.99.99.99/32"
 ```
 
 ## PCEP / SR-TE Control Plane (pola)
@@ -339,10 +452,6 @@ Two further encoder defects found while proving this:
 - **Admin-groups and adjacency-SIDs are not encoded either.** Link NLRIs carry only `igp_metric`, `bandwidth`, `reservable_bandwidth`, `unreserved_bandwidth`. The `Ext Admin Group: 0x1/0x2` present in `show isis mpls-te database` never reaches BGP-LS, so affinity-constrained PCE-side computation is also out.
 - **Link metric is corrupted in transit.** `p5↔p6` is configured `isis metric 100` and appears correctly as `Metric: 100` in the TED, but arrives as `"igp_metric":36` over BGP-LS.
 
-Two design notes worth keeping:
-
-- **`mpls-te export` exports the full LSDB**. `mpls-te export` on `pe11` produced all 50+. This also means the core does **not** need `bgpd` enabled on P routers; one exporter covers the whole topology. (The command is mutually exclusive with `distribute link-state`.)
-
 Consequence for pola generally: both routes to using it are currently blocked. Dynamic paths need the TED, which needs Prefix-SIDs FRR doesn't send. Explicit paths don't need the TED but require `pola sr-policy add -s`, and that flag is broken in pola v1.3.3 — `addSRPolicyWithoutSIDValidation()` sets neither `Asn` nor `SidValidate`, so the request still lands in the TED-requiring server branch. Using pola requires either an FRR BGP-LS fix or a one-line pola patch.
 
 `ted.enable` is deliberately left **true** in `pola/polad.yaml` so the feed starts working the moment the upstream gap closes. [VALIDATION.md](VALIDATION.md) Layer 9 carries a revisit checklist — the exact commands, with what a *working* feed should return in each one alongside what 10.7.1 currently returns.
@@ -354,8 +463,7 @@ Clone this repository and start the lab:
 ```shell
 git clone https://github.com/dbono711/clab-frr-sr-mpls.git
 cd clab-frr-sr-mpls
-sudo modprobe mpls_router mpls_iptunnel mpls_gso
-sudo clab deploy -t lab.yml
+make all
 ```
 
 **_NOTE: CONTAINERlab requires SUDO privileges in order to execute_**
@@ -408,7 +516,7 @@ sudo ip netns exec clab-frr-sr-mpls-pe11 tcpdump -nni eth1
 ## Cleanup
 
 ```shell
-clab destroy -t lab.yml
+make clean
 ```
 
 ## Author
